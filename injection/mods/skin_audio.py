@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Skin sound banks
-Fixes a skin package whose skin0.bin plays another skin's sounds, or plays nothing where it has no sound of its own.
+Fixes a skin package whose skin0.bin plays another skin's sounds, or no sound for events the game's bins name.
 
 A skin package runs the skin as the champion's default one, and the game then plays the default skin's events
 ("Play_sfx_Yasuo_..."). So the package names its banks after the default skin (LTK Manager turns the overlay off for a
@@ -19,11 +19,12 @@ built the way the packages build theirs: from the game's copy, with the default 
 skin's events bank without them. Banks the package ships itself for the skin (a *_basetag_events.bnk) stay. Risen
 Legend Ahri and Kai'Sa's packages had the same fault.
 
-A package that plays the default skin's event names without the default skin's banks of a kind plays nothing for the
-events the skin has no sound of: Genesis Nightbringer Yasuo's EQ hit, Q3 tornado and wind wall, and 7,474 events of 678
-of LeagueSkins' 1,963 skins (patch 16.22). The default skin's banks of that kind come along, without the events the
-package's banks already play (those would be loaded first and played instead). A package whose banks are the skin's
-own, with the default skin's or a sound for every default event, is not touched.
+The game plays an event named after one of the skin's tags (tagEventList) as the most specific tag's event it has:
+Genesis Nightbringer Yasuo's E dash effect names "Play_sfx_YasuoSkin09_YasuoDashWrapper_cast", and the game plays
+Skin87's dash for it. A package keeps only the default tag, so such a name is played as it is and nothing answers it:
+the E made no sound. Each name of the game's bins (the skin's, its animations' and the bins they link) that is after a
+tag the package dropped gets a copy of the event the game would take, in the bank that holds that event. A package
+whose banks and events already answer every name is not touched.
 
 A bin (PROP v3) is: links, the entries' class hashes, then the entries, each "u32 size, u32 key, u16 field count,
 fields". A field is "u32 name hash, u8 type, value". Only the fields on the way to the bank units are read; any other
@@ -169,6 +170,17 @@ def _audio_field(data: bytes) -> Optional[Tuple[int, _Field]]:
             return None
         return entry, audio
     return None
+
+
+def _links(data: bytes) -> List[str]:
+    """The bins a bin links (loaded with it)."""
+    if data[:4] != b"PROP" or struct.unpack_from("<I", data, 4)[0] < 2:
+        return []
+    out, at = [], 12
+    for _ in range(struct.unpack_from("<I", data, 8)[0]):
+        out.append(_string_at(data, at))
+        at += 2 + struct.unpack_from("<H", data, at)[0]
+    return out
 
 
 def _string_at(data: bytes, at: int) -> str:
@@ -421,15 +433,6 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     def is_default(path: str) -> bool:
         return "/skins/base/" in path.lower()
 
-    # Most packages only name the skin's own banks, and the default skin's next to them: the game's wad (a hundred
-    # MB) is then not read
-    numbers = {i % 1000 for i in skin_ids if i and i % 1000}
-    other_skin = any(_skin_of(p) not in (None, *numbers) and _kind_of(p) and not ships(p)
-                     for u in units for p in u.paths)
-    kinds = {_kind_of(p) for u in units for p in u.paths} - {None}
-    without_default = {k for k in kinds if not any(_kind_of(p) == k and is_default(p) for u in units for p in u.paths)}
-    if not other_skin and not (default_tags and without_default):
-        return False
     game = _game_skin(game_wads[0], lower, skin_ids)
     if not game:
         return False
@@ -441,17 +444,6 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     events = [list(u.events) for u in units]
     written: Dict[int, bytes] = {}
     fixes = []
-
-    def loaded_events(kind: str) -> set:
-        """The events the package's banks of a kind hold, as they will be loaded."""
-        ids = set()
-        for path in dict.fromkeys(p for unit_paths in paths for p in unit_paths):
-            if _kind_of(path) == kind and path.lower().endswith("_events.bnk"):
-                h = _xxh64(path.lower().encode("utf-8"))
-                bank = written.get(h) or _read_bank(path, mod_wad, game_wads)
-                if bank:
-                    ids |= {oid for t, oid, _ in _objects(bank) if t == _HIRC_EVENT}
-        return ids
 
     # A. The banks of another skin the game does not load for this one, by the kind of sound they hold (a file the
     # package ships itself, as a *_basetag_events.bnk, is its own): the unit gets the game's banks of that kind,
@@ -509,40 +501,64 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
                          + ", ".join(Path(p).name for p in new_paths if p not in unit.paths))
             paths[i], events[i] = new_paths, new_events
 
-    # B. The skin plays the default skin's events, and the package has no default bank of a kind: the events the
-    # skin has no sound of play nothing (Genesis Nightbringer Yasuo's EQ hit, Q3 tornado, wind wall...). The default
-    # skin's banks of that kind come along, without the events the skin's own banks play under the same names.
-    default_bin = None
-    if default_tags:
-        default_bin = _read_entry(game_wads[0], _xxh64(f"data/characters/{lower}/skins/skin0.bin".encode()))
-    default_units = bank_units(default_bin) if default_bin else []
-    for kind in sorted(kinds):
-        if not default_units or any(_kind_of(p) == kind and is_default(p) for unit_paths in paths for p in unit_paths):
-            continue
-        base_units = [u for u in default_units if any(_kind_of(p) == kind for p in u.paths)]
-        base_paths = list(dict.fromkeys(p for u in base_units for p in u.paths if is_default(p)))
-        holders = [i for i, unit_paths in enumerate(paths) if any(_kind_of(p) == kind for p in unit_paths)]
-        if not base_paths or not holders:
-            continue
-        played = loaded_events(kind)
-        base_banks = {}
-        for path in base_paths:
+    # B. The game's bins name some events after a tag the package dropped: Genesis Nightbringer Yasuo's E dash
+    # effect plays "Play_sfx_YasuoSkin09_YasuoDashWrapper_cast", which the game plays as the skin's own
+    # ("YasuoSkin09" is in its tagEventList). With the default tag only, the name is played as it is and nothing
+    # answers it. Each such name gets the event the game would take, the most specific of its tags first.
+    game_tags = tag_events(game_bin)
+    dropped = [t for t in game_tags if t not in default_tags]
+    if default_tags and dropped:
+        names = []
+        todo, seen_bins = [game_bin], set()
+        animations = _read_entry(game_wads[0], _xxh64(f"data/characters/{lower}/animations/skin{number}.bin".encode()))
+        if animations:
+            todo.append(animations)
+        while todo:
+            data = todo.pop()
+            names += event_names(data)
+            for link in _links(data):
+                if link.lower() not in seen_bins and link.lower() != f"data/characters/{lower}/{lower}.bin":
+                    seen_bins.add(link.lower())
+                    linked = _read_entry(game_wads[0], _xxh64(link.lower().encode("utf-8")))
+                    if linked:
+                        todo.append(linked)
+        holders: Dict[int, str] = {}
+        banks: Dict[str, bytes] = {}
+        for path in dict.fromkeys(p for unit_paths in paths for p in unit_paths):
             if path.lower().endswith("_events.bnk"):
-                bank = _read_bank(path, mod_wad, game_wads)
+                bank = written.get(_xxh64(path.lower().encode("utf-8"))) or _read_bank(path, mod_wad, game_wads)
                 if bank:
-                    base_banks[path] = bank
-        # only the events the default skin has a sound of (a unit also lists events nothing plays)
-        sounded = {oid for bank in base_banks.values() for t, oid, _ in _objects(bank) if t == _HIRC_EVENT}
-        silent = [e for e in dict.fromkeys(e for u in base_units for e in u.events)
-                  if event_id(e) in sounded and event_id(e) not in played]
-        if not silent:
-            continue
-        for path, bank in base_banks.items():
-            written[_xxh64(path.lower().encode())] = without_events(bank, played)
-        i = holders[-1]
-        paths[i] = base_paths + [p for p in paths[i] if p.lower() not in {q.lower() for q in base_paths}]
-        events[i] = list(dict.fromkeys(events[i] + silent))
-        fixes.append(f"{len(silent)} default {kind} event(s) had no sound, the default skin's banks now play them")
+                    banks[path] = bank
+                    for t, oid, _ in _objects(bank):
+                        if t == _HIRC_EVENT:
+                            holders.setdefault(oid, path)
+        aliases_by_bank: Dict[str, Dict[int, int]] = {}
+        alias_names: Dict[int, str] = {}
+        for name in dict.fromkeys(names):
+            if event_id(name) in holders:
+                continue
+            # a name after any of the skin's tags: a dropped one, or the default one the package's copies of the
+            # skin's events missed (Arcane Councilor Mel's "Play_sfx_Mel_Dance3D_leadin" is MelSkin01's in the game)
+            tag = max((t for t in game_tags if f"_{t}_" in name), key=len, default=None)
+            if not tag:
+                continue
+            for candidate_tag in reversed(game_tags):
+                candidate = name.replace(f"_{tag}_", f"_{candidate_tag}_", 1)
+                if event_id(candidate) in holders:
+                    aliases_by_bank.setdefault(holders[event_id(candidate)], {})[event_id(name)] = event_id(candidate)
+                    alias_names[event_id(name)] = name
+                    break
+        added_names = []
+        for path, aliases in aliases_by_bank.items():
+            bank, added = with_aliases(banks[path], aliases)
+            if added:
+                written[_xxh64(path.lower().encode("utf-8"))] = bank
+                added_names += [alias_names[i] for i in added]
+                i = next(i for i, unit_paths in enumerate(paths) if path in unit_paths)
+                events[i] = list(dict.fromkeys(events[i] + [alias_names[a] for a in added]))
+        if added_names:
+            fixes.append(f"{len(added_names)} event(s) named after a dropped tag now play the skin's sound "
+                         f"({', '.join(sorted(added_names)[:3])}...)")
 
     if not fixes:
         return False

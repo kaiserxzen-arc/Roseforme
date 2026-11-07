@@ -115,6 +115,7 @@ BASETAG = "ASSETS/Sounds/Wwise2016/VO/Characters/Yasuo/Skins/Skin56/Yasuo_Skin56
 DASH_SKIN = "Play_sfx_YasuoSkin09_YasuoDashWrapper_cast"
 DASH_BASE = "Play_sfx_Yasuo_YasuoDashWrapper_cast"
 EQ_HIT_BASE = "Play_sfx_Yasuo_YasuoEQComboSoundHit_OnHit"
+DASH_87 = "Play_sfx_YasuoSkin87_YasuoDashWrapper_cast"
 
 
 class SkinAudioTests(unittest.TestCase):
@@ -248,53 +249,63 @@ class SkinAudioTests(unittest.TestCase):
         self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157000]), [])
         self.assertEqual(self.mod_wad.read_bytes(), packed)
 
-    def _genesis(self):
-        """Genesis Nightbringer Yasuo: the game gives skin 87 its own sound effects only, and the package (right
-        about its banks) plays them under the default skin's names, without the default skin's bank."""
+    def _genesis(self, effect_event):
+        """Genesis Nightbringer Yasuo: skin 87 has its own sound effects, and its E dash effect names its sound
+        after Nightbringer (skin 9), one of its tags. The package (right about its banks) keeps the default tag only
+        and plays Skin87's events under the default skin's names."""
         skin87_bank = f"{SOUNDS}/Skin87/Yasuo_Skin87_SFX_events.bnk"
-        dash_87 = "Play_sfx_YasuoSkin87_YasuoDashWrapper_cast"
         files = dict(self.game_files)
-        files["data/characters/yasuo/skins/skin0.bin"] = skin_bin(
-            [bank_unit("Yasuo_Base_SFX", BASE_SFX, [DASH_BASE, EQ_HIT_BASE])])
+        files.pop(SKIN9)  # the test bins link Skin9.bin, which the game's skin 87 does not
         files["data/characters/yasuo/skins/skin87.bin"] = skin_bin(
-            [bank_unit("Yasuo_Skin87_SFX", SKIN87_SFX, [dash_87])], tags=("Yasuo", "YasuoSkin87"))
-        files[skin87_bank] = bank([dash_87])
+            [bank_unit("Yasuo_Skin87_SFX", SKIN87_SFX, [DASH_87])],
+            tags=("Yasuo", "YasuoSkin09", "YasuoSkin87"), extra=effect_event)
+        files[skin87_bank] = bank([DASH_87])
         self._game(files)
-        # the package's copy of Skin87's bank: its dash under the default name too
-        shipped = bank([dash_87], aliases=[(DASH_BASE, dash_87)])
         self.mod = self.mod.with_name("157087")
         (self.mod / "WAD").mkdir(parents=True)
         self.mod_wad = self.mod / "WAD" / "Yasuo.wad.client"
         self.mod_wad.write_bytes(wad({
-            SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", SKIN87_SFX, [dash_87, DASH_BASE])]),
-            skin87_bank: shipped,
+            SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", SKIN87_SFX, [DASH_87, DASH_BASE])]),
+            skin87_bank: bank([DASH_87], aliases=[(DASH_BASE, DASH_87)]),
         }))
         return skin87_bank
 
-    def test_the_default_skins_banks_play_what_the_skin_has_no_sound_of(self):
-        skin87_bank = self._genesis()
-        self.assertEqual(bank_events(self._entry(skin87_bank)).keys(), {event_id(DASH_BASE),
-                                                                        event_id("Play_sfx_YasuoSkin87_YasuoDashWrapper_cast")})
+    def test_an_event_named_after_a_dropped_tag_plays_the_skins_sound(self):
+        skin87_bank = self._genesis(DASH_SKIN)
 
         self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157087]), ["Yasuo"])
 
-        self.assertEqual(self._units(), [("Yasuo_Base_SFX", BASE_SFX + SKIN87_SFX)])
-        base_events = bank_events(self._entry(BASE_SFX[1]))
-        # the E-Q hit Skin87 has no sound of now plays the default skin's...
-        self.assertIn(event_id(EQ_HIT_BASE), base_events)
-        self.assertIn(EQ_HIT_BASE, skin_audio.bank_units(self._entry(SKIN0))[0].events)
-        # ...while the dash stays Skin87's: the default skin's would be loaded first and played instead
-        self.assertNotIn(event_id(DASH_BASE), base_events)
-        self.assertIn(event_id(DASH_BASE), bank_events(self._entry(skin87_bank)))
+        # the E dash effect's Nightbringer name plays Skin87's dash, as the game plays it
+        events = bank_events(self._entry(skin87_bank))
+        self.assertEqual(events[event_id(DASH_SKIN)], events[event_id(DASH_87)])
+        self.assertIn(DASH_SKIN, skin_audio.bank_units(self._entry(SKIN0))[0].events)
+        # the banks stay the package's, and the default skin's are not added
+        self.assertEqual(self._units(), [("Yasuo_Base_SFX", SKIN87_SFX)])
+        self.assertIsNone(self._entry(BASE_SFX[1]))
 
-    def test_a_skin_with_a_sound_for_every_default_event_needs_no_default_bank(self):
-        self._genesis()
+    def test_a_default_name_the_package_missed_plays_the_skins_sound(self):
+        # the game plays the default skin's recall name as Skin87's recall; the package copied the dash only
+        recall_87, recall_base = "Play_sfx_YasuoSkin87_Recall3D_buffactivate", "Play_sfx_Yasuo_Recall3D_buffactivate"
+        skin87_bank = self._genesis(recall_base)
         files = dict(self.game_files)
-        files["data/characters/yasuo/skins/skin0.bin"] = skin_bin(
-            [bank_unit("Yasuo_Base_SFX", BASE_SFX, [DASH_BASE])])
+        files.pop(SKIN9)
         files["data/characters/yasuo/skins/skin87.bin"] = skin_bin(
-            [bank_unit("Yasuo_Skin87_SFX", SKIN87_SFX)], tags=("Yasuo", "YasuoSkin87"))
+            [bank_unit("Yasuo_Skin87_SFX", SKIN87_SFX, [DASH_87, recall_87])],
+            tags=("Yasuo", "YasuoSkin09", "YasuoSkin87"), extra=recall_base)
+        files[skin87_bank] = bank([DASH_87, recall_87])
         self._game(files)
+        self.mod_wad.write_bytes(wad({
+            SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", SKIN87_SFX, [DASH_87, DASH_BASE])]),
+            skin87_bank: bank([DASH_87, recall_87], aliases=[(DASH_BASE, DASH_87)]),
+        }))
+
+        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157087]), ["Yasuo"])
+
+        events = bank_events(self._entry(skin87_bank))
+        self.assertEqual(events[event_id(recall_base)], events[event_id(recall_87)])
+
+    def test_a_package_answering_every_name_is_left_alone(self):
+        self._genesis("a note that names no event")
         packed = self.mod_wad.read_bytes()
 
         self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157087]), [])
