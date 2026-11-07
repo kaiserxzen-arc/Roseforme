@@ -311,6 +311,49 @@ class SkinAudioTests(unittest.TestCase):
         self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157087]), [])
         self.assertEqual(self.mod_wad.read_bytes(), packed)
 
+    def _nightbringer_voice(self):
+        """Nightbringer Yasuo's voice: the game loads the default skin's voice bank next to Skin09's, the package
+        Skin09's only, with its lines under the default skin's names (a basetag bank)."""
+        base_vo = ["ASSETS/Sounds/Wwise2016/VO/en_US/Characters/Yasuo/Skins/Base/Yasuo_Base_VO_audio.bnk",
+                   "ASSETS/Sounds/Wwise2016/VO/en_US/Characters/Yasuo/Skins/Base/Yasuo_Base_VO_events.bnk"]
+        skin_vo_events = "ASSETS/Sounds/Wwise2016/VO/en_US/Characters/Yasuo/Skins/Skin09/Yasuo_Skin09_VO_events.bnk"
+        basetag = "ASSETS/Sounds/Wwise2016/VO/Characters/Yasuo/Skins/Skin09/Yasuo_Skin09_VO_basetag_events.bnk"
+        dash_line, yone_line = "Play_vo_Yasuo_YasuoEDash_cast3D", "Play_vo_Yasuo_FirstEncounter3DYone"
+        files = dict(self.game_files)
+        files[SKIN9] = skin_bin([
+            bank_unit("Yasuo_Base_SFX", BASE_SFX + SKIN09_SFX),
+            bank_unit("Yasuo_Base_VO", base_vo, [dash_line, yone_line]),
+            bank_unit("Yasuo_Skin09_VO", VO + [skin_vo_events], ["Play_vo_YasuoSkin09_YasuoEDash_cast3D"]),
+        ], tags=("YasuoSkin09",))
+        self._game(files)
+        # the voice banks are in the language's wad
+        (self.game_dir / "DATA" / "FINAL" / "Champions" / "Yasuo.ko_KR.wad.client").write_bytes(wad({
+            base_vo[1]: bank([dash_line, yone_line]),
+            skin_vo_events: bank(["Play_vo_YasuoSkin09_YasuoEDash_cast3D"]),
+        }))
+        self.mod_wad.write_bytes(wad({
+            SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", BASE_SFX + SKIN09_SFX),
+                             bank_unit("Yasuo_Base_VO", VO + [skin_vo_events, basetag])]),
+            basetag: bank([], aliases=[(dash_line, "Play_vo_YasuoSkin09_YasuoEDash_cast3D")]),
+        }))
+        return base_vo, basetag, dash_line, yone_line
+
+    def test_a_bank_the_game_loads_for_the_skin_is_added(self):
+        base_vo, basetag, dash_line, yone_line = self._nightbringer_voice()
+
+        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157009]), ["Yasuo"])
+
+        voice = skin_audio.bank_units(self._entry(SKIN0))[1]
+        self.assertEqual(voice.paths[:2], base_vo)
+        # written next to the game's: the language's wad
+        language_wad = self.mod_wad.with_name("Yasuo.ko_KR.wad.client")
+        base_events = bank_events(_read_entry(language_wad, _xxh64(base_vo[1].lower().encode())))
+        # the line the skin has no voice of plays the default skin's...
+        self.assertIn(event_id(yone_line), base_events)
+        # ...and the E line stays Nightbringer's: the default skin's would be loaded first and played instead
+        self.assertNotIn(event_id(dash_line), base_events)
+        self.assertIn(event_id(dash_line), bank_events(self._entry(basetag)))
+
     def test_without_a_game_folder_nothing_is_done(self):
         self.mod_wad.write_bytes(wad({SKIN0: self.broken}))
 

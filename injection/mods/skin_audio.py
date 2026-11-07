@@ -345,8 +345,9 @@ def without_events(bank: bytes, ids: Iterable[int]) -> bytes:
 # --------------------------------------------------------------------------------------
 
 def write_wad_entries(wad: Path, contents: Dict[int, bytes]) -> None:
-    """Rewrites a packed wad v3 with these entries replaced or added (zstd, with their xxh3 checksums)."""
-    data = wad.read_bytes()
+    """Rewrites a packed wad v3 with these entries replaced or added (zstd, with their xxh3 checksums), or writes
+    a new one."""
+    data = wad.read_bytes() if wad.is_file() else b"RW\x03\x04" + bytes(_WAD_HEADER - 4)  # a new wad
     if len(data) < _WAD_HEADER or data[:2] != b"RW" or data[2] != 3:
         raise ValueError(f"{wad.name}: not a wad v3")
     count = struct.unpack_from("<I", data, 268)[0]
@@ -406,14 +407,20 @@ def _game_skin(game_wad: Path, alias: str, skin_ids: Iterable[int]) -> Optional[
     return None
 
 
-def _read_bank(path: str, mod_wad: Path, game_wads: Sequence[Path]) -> Optional[bytes]:
-    """A bank file: the package's copy when it ships one, the game's otherwise."""
+def _read_bank_from(path: str, mod_wad: Path, game_wads: Sequence[Path]) -> Tuple[Optional[bytes], str]:
+    """A bank file and the name of the wad it is in: the package's copy when it ships one, the game's otherwise (a
+    voice bank is in the language's wad, Yasuo.ko_KR.wad.client)."""
     path_hash = _xxh64(path.lower().encode("utf-8"))
     for wad in (mod_wad, *game_wads):
         found = _read_entry(wad, path_hash) if wad.is_file() else None
         if found:
-            return found
-    return None
+            return found, wad.name
+    return None, mod_wad.name
+
+
+def _read_bank(path: str, mod_wad: Path, game_wads: Sequence[Path]) -> Optional[bytes]:
+    """A bank file: the package's copy when it ships one, the game's otherwise."""
+    return _read_bank_from(path, mod_wad, game_wads)[0]
 
 
 def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequence[int]) -> bool:
@@ -443,7 +450,35 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     paths = [list(u.paths) for u in units]
     events = [list(u.events) for u in units]
     written: Dict[int, bytes] = {}
+    # the package's wad each written file goes to: the one named like the wad it was read from, as the game reads a
+    # file from the wad it has it in (a voice bank from the language's wad)
+    wad_of: Dict[int, str] = {}
     fixes = []
+
+    def read(path: str) -> Optional[bytes]:
+        h = _xxh64(path.lower().encode("utf-8"))
+        if h in written:
+            return written[h]
+        bank, wad_name = _read_bank_from(path, mod_wad, game_wads)
+        wad_of.setdefault(h, wad_name)
+        return bank
+
+    def write(path: str, bank: bytes) -> None:
+        h = _xxh64(path.lower().encode("utf-8"))
+        if h not in wad_of:
+            read(path)
+        written[h] = bank
+
+    def answered() -> Dict[int, str]:
+        """The events the package's banks answer, with the bank answering each."""
+        holders: Dict[int, str] = {}
+        for path in dict.fromkeys(p for unit_paths in paths for p in unit_paths):
+            if path.lower().endswith("_events.bnk"):
+                bank = read(path)
+                for t, oid, _ in _objects(bank) if bank else []:
+                    if t == _HIRC_EVENT:
+                        holders.setdefault(oid, path)
+        return holders
 
     # A. The banks of another skin the game does not load for this one, by the kind of sound they hold (a file the
     # package ships itself, as a *_basetag_events.bnk, is its own): the unit gets the game's banks of that kind,
@@ -484,24 +519,49 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
                 added = []
                 for path in new_paths:
                     if path.lower().endswith("_events.bnk") and not is_default(path):
-                        bank = _read_bank(path, mod_wad, game_wads)
+                        bank = read(path)
                         if bank:
                             bank, new_ids = with_aliases(bank, aliases)
-                            written[_xxh64(path.lower().encode())] = bank
+                            write(path, bank)
                             added += new_ids
                 # the default skin's events of those names would come first and be the ones played
                 for path in new_paths:
                     if path.lower().endswith("_events.bnk") and is_default(path) and added:
-                        bank = _read_bank(path, mod_wad, game_wads)
+                        bank = read(path)
                         if bank:
-                            written[_xxh64(path.lower().encode())] = without_events(bank, added)
+                            write(path, without_events(bank, added))
                 new_events = list(dict.fromkeys(new_events + [alias_names[i] for i in added]))
                 done_kinds.add(kind)
             fixes.append(f"its {kind} banks were another skin's, now skin {number}'s: "
                          + ", ".join(Path(p).name for p in new_paths if p not in unit.paths))
             paths[i], events[i] = new_paths, new_events
 
-    # B. The game's bins name some events after a tag the package dropped: Genesis Nightbringer Yasuo's E dash
+    # B. Banks the game loads for the skin that the package leaves out, of a kind of sound it has: Nightbringer
+    # Yasuo's default voice lines (the default skin's voice bank), DJ Sona's dance, death and laugh (Skin06's sound
+    # effects). They join the package's unit of that kind, without the events the package's banks already answer,
+    # which are the ones it plays.
+    kinds = {_kind_of(p) for unit_paths in paths for p in unit_paths} - {None}
+    for kind in sorted(kinds):
+        have = {p.lower() for unit_paths in paths for p in unit_paths}
+        missing_units = [u for u in game_units
+                         if any(_kind_of(p) == kind and p.lower() not in have for p in u.paths)]
+        missing = list(dict.fromkeys(p for u in missing_units for p in u.paths if p.lower() not in have))
+        holders = [i for i, unit_paths in enumerate(paths) if any(_kind_of(p) == kind for p in unit_paths)]
+        if not missing or not holders:
+            continue
+        played = set(answered())
+        for path in missing:
+            if path.lower().endswith("_events.bnk"):
+                bank = read(path)
+                if bank:
+                    write(path, without_events(bank, played))
+        i = holders[-1]
+        paths[i] = [p for p in missing if is_default(p)] + paths[i] + [p for p in missing if not is_default(p)]
+        events[i] = list(dict.fromkeys(events[i] + [e for u in missing_units for e in u.events]))
+        fixes.append(f"the {kind} banks the game loads for skin {number} were left out: "
+                     + ", ".join(Path(p).name for p in missing))
+
+    # C. The game's bins name some events after a tag the package dropped: Genesis Nightbringer Yasuo's E dash
     # effect plays "Play_sfx_YasuoSkin09_YasuoDashWrapper_cast", which the game plays as the skin's own
     # ("YasuoSkin09" is in its tagEventList). With the default tag only, the name is played as it is and nothing
     # answers it. Each such name gets the event the game would take, the most specific of its tags first.
@@ -522,16 +582,7 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
                     linked = _read_entry(game_wads[0], _xxh64(link.lower().encode("utf-8")))
                     if linked:
                         todo.append(linked)
-        holders: Dict[int, str] = {}
-        banks: Dict[str, bytes] = {}
-        for path in dict.fromkeys(p for unit_paths in paths for p in unit_paths):
-            if path.lower().endswith("_events.bnk"):
-                bank = written.get(_xxh64(path.lower().encode("utf-8"))) or _read_bank(path, mod_wad, game_wads)
-                if bank:
-                    banks[path] = bank
-                    for t, oid, _ in _objects(bank):
-                        if t == _HIRC_EVENT:
-                            holders.setdefault(oid, path)
+        holders = answered()
         aliases_by_bank: Dict[str, Dict[int, int]] = {}
         alias_names: Dict[int, str] = {}
         for name in dict.fromkeys(names):
@@ -550,9 +601,9 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
                     break
         added_names = []
         for path, aliases in aliases_by_bank.items():
-            bank, added = with_aliases(banks[path], aliases)
+            bank, added = with_aliases(read(path), aliases)
             if added:
-                written[_xxh64(path.lower().encode("utf-8"))] = bank
+                write(path, bank)
                 added_names += [alias_names[i] for i in added]
                 i = next(i for i, unit_paths in enumerate(paths) if path in unit_paths)
                 events[i] = list(dict.fromkeys(events[i] + [alias_names[a] for a in added]))
@@ -565,7 +616,9 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     new_units = [_unit_with(unit, paths[i], events[i]) if (paths[i], events[i]) != (unit.paths, unit.events)
                  else unit.raw for i, unit in enumerate(units)]
     written[skin0_hash] = _with_units(skin0, new_units)
-    write_wad_entries(mod_wad, written)
+    wad_of[skin0_hash] = mod_wad.name
+    for wad_name in dict.fromkeys(wad_of[h] for h in written):
+        write_wad_entries(mod_wad.with_name(wad_name), {h: b for h, b in written.items() if wad_of[h] == wad_name})
     log.info(f"[SKINAUDIO] {alias} skin {number}: " + "; ".join(fixes))
     return True
 
