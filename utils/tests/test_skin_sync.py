@@ -347,10 +347,12 @@ class ReleaseCheckTests(unittest.TestCase):
 
     def test_the_latest_release_comes_from_the_redirect(self):
         def head(url, **kwargs):
-            self.assertEqual(url, "https://github.com/Alban1911/Rose/releases/download/1.5.2/update_package_1.5.2.zip")
+            self.assertEqual(
+                url, "https://github.com/kaiserxzen-arc/Roseforme/releases/download/1.5.2/update_package_1.5.2.zip")
             return FakeResponse(200, headers={"Content-Length": "35066861"})
 
-        redirect = FakeResponse(302, headers={"Location": "https://github.com/Alban1911/Rose/releases/tag/1.5.2"})
+        redirect = FakeResponse(302, headers={
+            "Location": "https://github.com/kaiserxzen-arc/Roseforme/releases/tag/1.5.2"})
         with patch("requests.get", return_value=redirect), patch("requests.head", side_effect=head), \
                 patch.object(self.github_client.github_rate_limit, "api_get") as api:
             release = self.github_client.GitHubClient().get_latest_release()
