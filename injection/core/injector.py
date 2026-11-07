@@ -206,8 +206,9 @@ class SkinInjector:
         mod_names = [mod_folder.name]
         skin_id = parse_skin_id(skin_name, champion_id)
 
-        # Some skin packages play another skin's sound banks (#462): they get the ones the game loads for the skin (a
-        # chroma's own, else its skin's). Rift Classic skins target other characters and are left as they are.
+        # Some skin packages play another skin's sound banks (#462), or nothing where the skin has no sound of its own:
+        # they get the banks the game has for the skin (a chroma's own, else its skin's) and its default skin. Rift
+        # Classic skins target other characters and are left as they are.
         if not classic:
             skin_audio.repair(self.game_dir, mod_folder, (skin_id, parent_skin_id(zp, skin_id)))
 

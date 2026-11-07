@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Skin sound banks
-Fixes a skin package whose skin0.bin plays another skin's sounds.
+Fixes a skin package whose skin0.bin plays another skin's sounds, or plays nothing where it has no sound of its own.
 
 A skin package runs the skin as the champion's default one, and the game then plays the default skin's events
 ("Play_sfx_Yasuo_..."). So the package names its banks after the default skin (LTK Manager turns the overlay off for a
@@ -16,8 +16,14 @@ skin's sounds, and the events Skin87 has no copy of (its E's EQ hit...) played n
 When a bank of the package names another skin that the game's own bin for the skin does not list, the bank unit that
 holds it gets the game's banks of that kind (sfx or vo) for the skin, and its events, and the skin's events bank is
 built the way the packages build theirs: from the game's copy, with the default skin's names added, and the default
-skin's events bank without them. Banks the package ships itself for the skin (a *_basetag_events.bnk) stay. A package
-whose banks are all the skin's own is not touched.
+skin's events bank without them. Banks the package ships itself for the skin (a *_basetag_events.bnk) stay. Risen
+Legend Ahri and Kai'Sa's packages had the same fault.
+
+A package that plays the default skin's event names without the default skin's banks of a kind plays nothing for the
+events the skin has no sound of: Genesis Nightbringer Yasuo's EQ hit, Q3 tornado and wind wall, and 7,474 events of 678
+of LeagueSkins' 1,963 skins (patch 16.22). The default skin's banks of that kind come along, without the events the
+package's banks already play (those would be loaded first and played instead). A package whose banks are the skin's
+own, with the default skin's or a sound for every default event, is not touched.
 
 A bin (PROP v3) is: links, the entries' class hashes, then the entries, each "u32 size, u32 key, u16 field count,
 fields". A field is "u32 name hash, u8 type, value". Only the fields on the way to the bank units are read; any other
@@ -291,18 +297,20 @@ def _hirc_objects(section: bytes) -> List[Tuple[int, int, bytes]]:
 def _with_objects(bank: bytes, objects: Sequence[Tuple[int, int, bytes]]) -> bytes:
     body = struct.pack("<I", len(objects)) + b"".join(
         struct.pack("<BII", kind, 4 + len(rest), oid) + rest for kind, oid, rest in objects)
+    sections = _bank_sections(bank)
+    if not any(tag == b"HIRC" for tag, _ in sections):
+        sections.append((b"HIRC", body))  # a bank without objects (an empty events bank)
     out = b""
-    for tag, data in _bank_sections(bank):
+    for tag, data in sections:
         data = body if tag == b"HIRC" else data
         out += tag + struct.pack("<I", len(data)) + data
     return out
 
 
 def _objects(bank: bytes) -> List[Tuple[int, int, bytes]]:
+    """The bank's objects (none for a bank without a HIRC section)."""
     hirc = next((data for tag, data in _bank_sections(bank) if tag == b"HIRC"), None)
-    if hirc is None:
-        raise ValueError("bank has no HIRC section")
-    return _hirc_objects(hirc)
+    return _hirc_objects(hirc) if hirc is not None else []
 
 
 def with_aliases(bank: bytes, aliases: Dict[int, int]) -> Tuple[bytes, List[int]]:
@@ -405,13 +413,22 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     if not skin0:
         return False
     units = bank_units(skin0)
+    default_tags = tag_events(skin0)
 
     def ships(path: str) -> bool:
         return bool(_wad_holds(mod_wad, {_xxh64(path.lower().encode("utf-8"))}))
 
-    # most packages only name the skin's own banks: the game's wad (a hundred MB) is then not read
+    def is_default(path: str) -> bool:
+        return "/skins/base/" in path.lower()
+
+    # Most packages only name the skin's own banks, and the default skin's next to them: the game's wad (a hundred
+    # MB) is then not read
     numbers = {i % 1000 for i in skin_ids if i and i % 1000}
-    if not any(_skin_of(p) not in (None, *numbers) and _kind_of(p) and not ships(p) for u in units for p in u.paths):
+    other_skin = any(_skin_of(p) not in (None, *numbers) and _kind_of(p) and not ships(p)
+                     for u in units for p in u.paths)
+    kinds = {_kind_of(p) for u in units for p in u.paths} - {None}
+    without_default = {k for k in kinds if not any(_kind_of(p) == k and is_default(p) for u in units for p in u.paths)}
+    if not other_skin and not (default_tags and without_default):
         return False
     game = _game_skin(game_wads[0], lower, skin_ids)
     if not game:
@@ -420,8 +437,25 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
     game_units = bank_units(game_bin)
     game_paths = {p.lower() for u in game_units for p in u.paths}
 
-    # the banks of another skin the game does not load for this one, by the kind of sound they hold (a file the
-    # package ships itself, as a *_basetag_events.bnk, is its own)
+    paths = [list(u.paths) for u in units]
+    events = [list(u.events) for u in units]
+    written: Dict[int, bytes] = {}
+    fixes = []
+
+    def loaded_events(kind: str) -> set:
+        """The events the package's banks of a kind hold, as they will be loaded."""
+        ids = set()
+        for path in dict.fromkeys(p for unit_paths in paths for p in unit_paths):
+            if _kind_of(path) == kind and path.lower().endswith("_events.bnk"):
+                h = _xxh64(path.lower().encode("utf-8"))
+                bank = written.get(h) or _read_bank(path, mod_wad, game_wads)
+                if bank:
+                    ids |= {oid for t, oid, _ in _objects(bank) if t == _HIRC_EVENT}
+        return ids
+
+    # A. The banks of another skin the game does not load for this one, by the kind of sound they hold (a file the
+    # package ships itself, as a *_basetag_events.bnk, is its own): the unit gets the game's banks of that kind,
+    # and the skin's events bank its events under the default skin's names
     wrong_kinds = set()
     for unit in units:
         for path in unit.paths:
@@ -429,62 +463,94 @@ def _repair_champion(game_dir: Path, mod_wad: Path, alias: str, skin_ids: Sequen
             if (skin is not None and skin != number and path.lower() not in game_paths and _kind_of(path)
                     and not ships(path)):
                 wrong_kinds.add(_kind_of(path))
-    if not wrong_kinds:
-        return False
+    if wrong_kinds:
+        skin_tags = [t for t in tag_events(game_bin) if t not in default_tags]
+        names = event_names(game_bin)
+        animations = _read_entry(game_wads[0], _xxh64(f"data/characters/{lower}/animations/skin{number}.bin".encode()))
+        if animations:
+            names += event_names(animations)
+        done_kinds = set()
+        for i, unit in enumerate(units):
+            unit_kinds = {_kind_of(p) for p in unit.paths} & wrong_kinds
+            if not unit_kinds:
+                continue
+            kind = sorted(unit_kinds)[0]
+            # the game's banks of that kind for the skin, then what the package ships for it itself
+            game_kind = [u for u in game_units if any(_kind_of(p) == kind for p in u.paths)]
+            new_paths = list(dict.fromkeys(p for u in game_kind for p in u.paths))
+            new_paths += [p for p in unit.paths if p.lower() not in {q.lower() for q in new_paths}
+                          and (_skin_of(p) in (None, number) or p.lower() in game_paths) and ships(p)]
+            new_events = list(dict.fromkeys(e for u in game_kind for e in u.events))
+            if default_tags and kind not in done_kinds:
+                aliases, alias_names = {}, {}
+                for name in dict.fromkeys(names + new_events):
+                    for tag in skin_tags:
+                        if f"_{tag}_" in name:
+                            alias_name = name.replace(f"_{tag}_", f"_{default_tags[0]}_")
+                            aliases[event_id(alias_name)] = event_id(name)
+                            alias_names[event_id(alias_name)] = alias_name
+                added = []
+                for path in new_paths:
+                    if path.lower().endswith("_events.bnk") and not is_default(path):
+                        bank = _read_bank(path, mod_wad, game_wads)
+                        if bank:
+                            bank, new_ids = with_aliases(bank, aliases)
+                            written[_xxh64(path.lower().encode())] = bank
+                            added += new_ids
+                # the default skin's events of those names would come first and be the ones played
+                for path in new_paths:
+                    if path.lower().endswith("_events.bnk") and is_default(path) and added:
+                        bank = _read_bank(path, mod_wad, game_wads)
+                        if bank:
+                            written[_xxh64(path.lower().encode())] = without_events(bank, added)
+                new_events = list(dict.fromkeys(new_events + [alias_names[i] for i in added]))
+                done_kinds.add(kind)
+            fixes.append(f"its {kind} banks were another skin's, now skin {number}'s: "
+                         + ", ".join(Path(p).name for p in new_paths if p not in unit.paths))
+            paths[i], events[i] = new_paths, new_events
 
-    default_tags, skin_tags = tag_events(skin0), [t for t in tag_events(game_bin) if t not in tag_events(skin0)]
-    names = event_names(game_bin)
-    animations = _read_entry(game_wads[0], _xxh64(f"data/characters/{lower}/animations/skin{number}.bin".encode()))
-    if animations:
-        names += event_names(animations)
-
-    new_units, written, restored = [], {}, []
-    done_kinds = set()
-    for unit in units:
-        kinds = {_kind_of(p) for p in unit.paths} & wrong_kinds
-        if not kinds:
-            new_units.append(unit.raw)
+    # B. The skin plays the default skin's events, and the package has no default bank of a kind: the events the
+    # skin has no sound of play nothing (Genesis Nightbringer Yasuo's EQ hit, Q3 tornado, wind wall...). The default
+    # skin's banks of that kind come along, without the events the skin's own banks play under the same names.
+    default_bin = None
+    if default_tags:
+        default_bin = _read_entry(game_wads[0], _xxh64(f"data/characters/{lower}/skins/skin0.bin".encode()))
+    default_units = bank_units(default_bin) if default_bin else []
+    for kind in sorted(kinds):
+        if not default_units or any(_kind_of(p) == kind and is_default(p) for unit_paths in paths for p in unit_paths):
             continue
-        kind = sorted(kinds)[0]
-        # the game's banks of that kind for the skin, then what the package ships for it itself
-        game_kind = [u for u in game_units if any(_kind_of(p) == kind for p in u.paths)]
-        paths = list(dict.fromkeys(p for u in game_kind for p in u.paths))
-        paths += [p for p in unit.paths if p.lower() not in {q.lower() for q in paths}
-                  and (_skin_of(p) in (None, number) or p.lower() in game_paths) and ships(p)]
-        events = list(dict.fromkeys(e for u in game_kind for e in u.events))
-
-        aliases, alias_names = {}, {}
-        if default_tags and kind not in done_kinds:
-            for name in dict.fromkeys(names + events):
-                for tag in skin_tags:
-                    if f"_{tag}_" in name:
-                        alias_name = name.replace(f"_{tag}_", f"_{default_tags[0]}_")
-                        aliases[event_id(alias_name)] = event_id(name)
-                        alias_names[event_id(alias_name)] = alias_name
-            added = []
-            for path in paths:
-                if not path.lower().endswith("_events.bnk") or "/skins/base/" in path.lower():
-                    continue
+        base_units = [u for u in default_units if any(_kind_of(p) == kind for p in u.paths)]
+        base_paths = list(dict.fromkeys(p for u in base_units for p in u.paths if is_default(p)))
+        holders = [i for i, unit_paths in enumerate(paths) if any(_kind_of(p) == kind for p in unit_paths)]
+        if not base_paths or not holders:
+            continue
+        played = loaded_events(kind)
+        base_banks = {}
+        for path in base_paths:
+            if path.lower().endswith("_events.bnk"):
                 bank = _read_bank(path, mod_wad, game_wads)
                 if bank:
-                    bank, new_ids = with_aliases(bank, aliases)
-                    written[_xxh64(path.lower().encode())] = bank
-                    added += new_ids
-            # the default skin's events of those names would come first and be the ones played
-            for path in paths:
-                if path.lower().endswith("_events.bnk") and "/skins/base/" in path.lower() and added:
-                    bank = _read_bank(path, mod_wad, game_wads)
-                    if bank:
-                        written[_xxh64(path.lower().encode())] = without_events(bank, added)
-            events = list(dict.fromkeys(events + [alias_names[i] for i in added]))
-            done_kinds.add(kind)
-        new_units.append(_unit_with(unit, paths, events))
-        restored += [Path(p).name for p in paths if p not in unit.paths]
+                    base_banks[path] = bank
+        # only the events the default skin has a sound of (a unit also lists events nothing plays)
+        sounded = {oid for bank in base_banks.values() for t, oid, _ in _objects(bank) if t == _HIRC_EVENT}
+        silent = [e for e in dict.fromkeys(e for u in base_units for e in u.events)
+                  if event_id(e) in sounded and event_id(e) not in played]
+        if not silent:
+            continue
+        for path, bank in base_banks.items():
+            written[_xxh64(path.lower().encode())] = without_events(bank, played)
+        i = holders[-1]
+        paths[i] = base_paths + [p for p in paths[i] if p.lower() not in {q.lower() for q in base_paths}]
+        events[i] = list(dict.fromkeys(events[i] + silent))
+        fixes.append(f"{len(silent)} default {kind} event(s) had no sound, the default skin's banks now play them")
 
+    if not fixes:
+        return False
+    new_units = [_unit_with(unit, paths[i], events[i]) if (paths[i], events[i]) != (unit.paths, unit.events)
+                 else unit.raw for i, unit in enumerate(units)]
     written[skin0_hash] = _with_units(skin0, new_units)
     write_wad_entries(mod_wad, written)
-    log.info(f"[SKINAUDIO] {alias}: the skin played another skin's {'/'.join(sorted(wrong_kinds))} banks; it now loads "
-             f"skin {number}'s: {', '.join(restored)}")
+    log.info(f"[SKINAUDIO] {alias} skin {number}: " + "; ".join(fixes))
     return True
 
 
