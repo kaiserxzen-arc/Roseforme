@@ -154,56 +154,13 @@ class SkinAudioTests(unittest.TestCase):
     def _units(self):
         return [(u.name, u.paths) for u in skin_audio.bank_units(self._entry(SKIN0))]
 
-    def test_another_skins_sound_effects_become_the_skins_own(self):
-        self.mod_wad.write_bytes(wad({SKIN0: self.broken}))
+    def test_the_banks_the_package_loads_are_kept(self):
+        # Nightbringer Yasuo's package plays Genesis Nightbringer's (Skin87's) sound effects on purpose
+        packed = wad({SKIN0: self.broken, "assets/other.tex": b"texture"})
+        self.mod_wad.write_bytes(packed)
 
-        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157009]), ["Yasuo"])
-
-        # the game's sound effect banks for skin 9; the voice the package had right is kept
-        self.assertEqual(self._units(), [("Yasuo_Base_VO", VO), ("Yasuo_Base_SFX", BASE_SFX + SKIN09_SFX)])
-        unit = skin_audio.bank_units(self._entry(SKIN0))[1]
-        self.assertEqual(unit.events, [DASH_BASE, EQ_HIT_BASE, DASH_SKIN])
-        # still played under the default skin's tag
-        self.assertEqual(skin_audio.tag_events(self._entry(SKIN0)), ["Yasuo"])
-
-    def test_the_default_skins_events_play_the_skins_sounds(self):
-        self.mod_wad.write_bytes(wad({SKIN0: self.broken}))
-
-        skin_audio.repair(self.game_dir, self.mod, [157009])
-
-        skin_events = bank_events(self._entry(SKIN09_SFX[1]))
-        base_events = bank_events(self._entry(BASE_SFX[1]))
-        # the E plays Skin09's dash under the default name...
-        self.assertEqual(skin_events[event_id(DASH_BASE)], skin_events[event_id(DASH_SKIN)])
-        self.assertNotIn(event_id(DASH_BASE), base_events)
-        # ...and what Skin09 has no sound of keeps the default skin's
-        self.assertIn(event_id(EQ_HIT_BASE), base_events)
-        self.assertNotIn(event_id(EQ_HIT_BASE), skin_events)
-
-    def test_the_rest_of_the_package_is_kept(self):
-        self.mod_wad.write_bytes(wad({SKIN0: self.broken, "assets/other.tex": b"texture"}))
-
-        skin_audio.repair(self.game_dir, self.mod, [157009])
-
-        self.assertEqual(self._entry("assets/other.tex"), b"texture")
-        repaired = self._entry(SKIN0)
-        self.assertTrue(repaired.endswith(string("tail")))
-        self.assertEqual(repaired[:60], self.broken[:60])
-
-    def test_the_rewritten_wad_is_valid(self):
-        self.mod_wad.write_bytes(wad({SKIN0: self.broken, "assets/other.tex": b"texture"}))
-
-        skin_audio.repair(self.game_dir, self.mod, [157009])
-
-        data = self.mod_wad.read_bytes()
-        count = struct.unpack_from("<I", data, 268)[0]
-        hashes = []
-        for i in range(count):
-            path_hash, offset, packed, _, _, _, _, checksum = struct.unpack_from("<QIIIBBHQ", data, 272 + 32 * i)
-            hashes.append(path_hash)
-            self.assertEqual(checksum, xxhash.xxh3_64_intdigest(data[offset:offset + packed]))
-        self.assertEqual(hashes, sorted(hashes))
-        self.assertEqual(count, 4)  # skin0, the texture, and the two events banks
+        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157009]), [])
+        self.assertEqual(self.mod_wad.read_bytes(), packed)
 
     def test_a_skin_playing_its_own_banks_is_left_alone(self):
         packed = wad({SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", BASE_SFX + SKIN09_SFX)])})
@@ -366,21 +323,51 @@ class SkinAudioTests(unittest.TestCase):
         }))
         return base_vo, basetag, dash_line, yone_line
 
-    def test_a_bank_the_game_loads_for_the_skin_is_added(self):
-        base_vo, basetag, dash_line, yone_line = self._nightbringer_voice()
+    def test_a_bank_the_package_leaves_out_is_not_added(self):
+        base_vo, _, _, _ = self._nightbringer_voice()
+        packed = self.mod_wad.read_bytes()
 
-        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157009]), ["Yasuo"])
+        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157009]), [])
+        self.assertEqual(self.mod_wad.read_bytes(), packed)
+        self.assertFalse(self.mod_wad.with_name("Yasuo.ko_KR.wad.client").exists())
 
-        voice = skin_audio.bank_units(self._entry(SKIN0))[1]
-        self.assertEqual(voice.paths[:2], base_vo)
-        # written next to the game's: the language's wad
+    def test_the_rewritten_wads_are_valid(self):
+        skin87_bank = self._genesis(DASH_SKIN)
+        voice_bank = "ASSETS/Sounds/Wwise2016/VO/en_US/Characters/Yasuo/Skins/Skin87/Yasuo_Skin87_VO_events.bnk"
+        # a voice bank is in the language's wad: its copy goes to the package's wad of that name
+        (self.game_dir / "DATA" / "FINAL" / "Champions" / "Yasuo.ko_KR.wad.client").write_bytes(wad({
+            voice_bank: bank(["Play_vo_YasuoSkin87_YasuoEDash_cast3D"]),
+        }))
+        files = dict(self.game_files)
+        files.pop(SKIN9)
+        files["data/characters/yasuo/skins/skin87.bin"] = skin_bin(
+            [bank_unit("Yasuo_Skin87_SFX", SKIN87_SFX, [DASH_87])],
+            tags=("Yasuo", "YasuoSkin09", "YasuoSkin87"), extra="Play_vo_YasuoSkin09_YasuoEDash_cast3D")
+        files[skin87_bank] = bank([DASH_87])
+        self._game(files)
+        self.mod_wad.write_bytes(wad({
+            SKIN0: skin_bin([bank_unit("Yasuo_Base_SFX", SKIN87_SFX, [DASH_87, DASH_BASE]),
+                             bank_unit("Yasuo_Base_VO", [voice_bank])]),
+            skin87_bank: bank([DASH_87], aliases=[(DASH_BASE, DASH_87)]),
+            "assets/other.tex": b"texture",
+        }))
+
+        self.assertEqual(skin_audio.repair(self.game_dir, self.mod, [157087]), ["Yasuo"])
+
+        self.assertEqual(self._entry("assets/other.tex"), b"texture")
         language_wad = self.mod_wad.with_name("Yasuo.ko_KR.wad.client")
-        base_events = bank_events(_read_entry(language_wad, _xxh64(base_vo[1].lower().encode())))
-        # the line the skin has no voice of plays the default skin's...
-        self.assertIn(event_id(yone_line), base_events)
-        # ...and the E line stays Nightbringer's: the default skin's would be loaded first and played instead
-        self.assertNotIn(event_id(dash_line), base_events)
-        self.assertIn(event_id(dash_line), bank_events(self._entry(basetag)))
+        voice = bank_events(_read_entry(language_wad, _xxh64(voice_bank.lower().encode())))
+        self.assertEqual(voice[event_id("Play_vo_YasuoSkin09_YasuoEDash_cast3D")],
+                         voice[event_id("Play_vo_YasuoSkin87_YasuoEDash_cast3D")])
+        for wad_file in (self.mod_wad, language_wad):
+            data = wad_file.read_bytes()
+            count = struct.unpack_from("<I", data, 268)[0]
+            hashes = []
+            for i in range(count):
+                path_hash, offset, packed, _, _, _, _, checksum = struct.unpack_from("<QIIIBBHQ", data, 272 + 32 * i)
+                hashes.append(path_hash)
+                self.assertEqual(checksum, xxhash.xxh3_64_intdigest(data[offset:offset + packed]))
+            self.assertEqual(hashes, sorted(hashes))
 
     def test_without_a_game_folder_nothing_is_done(self):
         self.mod_wad.write_bytes(wad({SKIN0: self.broken}))
